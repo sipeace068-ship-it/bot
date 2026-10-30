@@ -1,227 +1,263 @@
-import os
-import json
+import asyncio
 import logging
-import time
-import threading
-from datetime import datetime
-from flask import Flask, jsonify
-import requests
+import os
 
-# === CONFIGURATION ===
-TOKEN = os.environ.get('BOT_TOKEN')
-PORT = int(os.environ.get('PORT', 8080))
-DATA_FILE = 'vip_reload_users.json'
+from deep_translator import GoogleTranslator
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
-logging.basicConfig(level=logging.INFO)
+TOKEN = os.getenv("BOT_TOKEN")
+
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=logging.INFO,
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# === STORAGE ===
-class Storage:
-    def __init__(self, filename=DATA_FILE):
-        self.filename = filename
-        self.data = self._load_data()
+# This dictionary stores each user's selected language while the bot runs.
+USER_LANGUAGES = {}
 
-    def _load_data(self):
-        if os.path.exists(self.filename):
-            try:
-                with open(self.filename, 'r') as f:
-                    return json.load(f)
-            except:
-                return {}
-        return {}
 
-    def _save_data(self):
-        try:
-            with open(self.filename, 'w') as f:
-                json.dump(self.data, f, indent=2)
-        except Exception as e:
-            logger.error(f"Save error: {e}")
+def get_language_name(language):
+    """Validate a language name or code."""
+    language = language.strip().lower()
+    supported = GoogleTranslator().get_supported_languages(as_dict=True)
 
-    def get_user(self, user_id):
-        if user_id not in self.data:
-            self.data[user_id] = {
-                'user_id': user_id,
-                'joined_at': datetime.now().isoformat(),
-                'username': '',
-                'first_name': ''
-            }
-            self._save_data()
-        return self.data[user_id]
+    if language in supported:
+        return language
 
-    def save_user(self, user_id, data):
-        self.data[user_id] = data
-        self._save_data()
+    for name, code in supported.items():
+        if code.lower() == language:
+            return name
 
-    def get_all_users(self):
-        return self.data
+    raise ValueError("Unsupported language")
 
-storage = Storage()
 
-# === TELEGRAM API ===
-def send_message(chat_id, text, parse_mode='Markdown'):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    try:
-        requests.post(url, json={
-            'chat_id': chat_id,
-            'text': text,
-            'parse_mode': parse_mode
-        }, timeout=10)
-    except Exception as e:
-        logger.error(f"Send error: {e}")
+async def translate_text(text, target):
+    """Run translation without blocking Telegram's event loop."""
+    language = get_language_name(target)
 
-def get_updates(offset=None):
-    url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
-    params = {'timeout': 30}
-    if offset:
-        params['offset'] = offset
-    try:
-        r = requests.get(url, params=params, timeout=35)
-        if r.status_code == 200:
-            return r.json().get('result', [])
-    except Exception as e:
-        logger.error(f"Get updates error: {e}")
-    return []
-
-def delete_webhook():
-    try:
-        requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook", timeout=10)
-    except:
-        pass
-
-# === CONTENT ===
-VIP_TOOLS = """
-🛠 *VIP Digital Tools*
-• Premium productivity templates
-• High-speed VPN alternatives
-• Cloud storage optimization guides
-• AI prompt libraries for work
-"""
-
-VIP_NEWS = """
-📰 *Tech & Finance Insights*
-• Weekly market trend summaries
-• Tech startup news
-• Productivity hacks
-• Automation workflows
-"""
-
-def handle_start(chat_id, user_data):
-    user_id = str(chat_id)
-    user = storage.get_user(user_id)
-    user['username'] = user_data.get('username', '')
-    user['first_name'] = user_data.get('first_name', 'Member')
-    storage.save_user(user_id, user)
-
-    welcome = f"""
-👑 Welcome to *VIP Reload*, {user['first_name']}!
-
-You have unlocked access to our premium digital network. We provide high-value insights, tech trends, and productivity tools.
-
-📋 *Your VIP Access:*
-/dashboard - View your VIP status
-/tools - Access VIP digital tools
-/insights - Read latest tech & finance insights
-/help - View commands
-
-Stay ahead. Stay reloaded. 🚀
-    """
-    send_message(chat_id, welcome)
-
-def handle_dashboard(chat_id):
-    send_message(
-        chat_id,
-        """
-👑 *VIP Dashboard*
-
-Status: *ACTIVE* 🟢
-Access Level: *Tier 1*
-
-Welcome to the network. Use the commands below to explore your benefits.
-        """
+    return await asyncio.to_thread(
+        GoogleTranslator(
+            source="auto",
+            target=language,
+        ).translate,
+        text,
     )
 
-def handle_tools(chat_id):
-    send_message(chat_id, VIP_TOOLS)
 
-def handle_insights(chat_id):
-    send_message(chat_id, VIP_NEWS)
-
-def handle_help(chat_id):
-    send_message(
-        chat_id,
-        """
-📚 *VIP Reload Commands*
-
-/dashboard - Check VIP status
-/tools - Get premium tools
-/insights - Read latest insights
-/help - Show this menu
-
-*Disclaimer:*
-This bot provides digital information and tools only. It does not offer financial advice, trading signals, or gambling services.
-        """
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "🌍 Welcome to Universal Translator!\n\n"
+        "I can translate text into many languages.\n\n"
+        "Commands:\n"
+        "/setlang Spanish - Set your language\n"
+        "/translate French Hello world - Translate text\n"
+        "/mylang - View your selected language\n"
+        "/languages - Show available languages\n"
+        "/stop - Disable automatic translation\n\n"
+        "First, choose your language using /setlang."
     )
 
-# === POLLING ===
-def process_updates():
-    last_update_id = 0
-    delete_webhook()
-    logger.info("Polling started...")
 
-    while True:
-        try:
-            updates = get_updates(last_update_id + 1 if last_update_id else None)
-            for update in updates:
-                uid = update.get('update_id')
-                if uid:
-                    last_update_id = uid
+async def set_language(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Usage: /setlang Spanish\n"
+            "You can also use a language code, such as /setlang es."
+        )
+        return
 
-                if 'message' in update:
-                    msg = update['message']
-                    chat_id = msg['chat']['id']
-                    user_data = msg.get('from', {})
+    target = " ".join(context.args)
 
-                    if 'text' in msg:
-                        text = msg['text']
+    try:
+        language = get_language_name(target)
 
-                        if text.startswith('/start'):
-                            handle_start(chat_id, user_data)
-                        elif text.startswith('/dashboard'):
-                            handle_dashboard(chat_id)
-                        elif text.startswith('/tools'):
-                            handle_tools(chat_id)
-                        elif text.startswith('/insights'):
-                            handle_insights(chat_id)
-                        elif text.startswith('/help'):
-                            handle_help(chat_id)
-                        else:
-                            send_message(
-                                chat_id,
-                                "Command not recognized. Use /help to see available commands."
-                            )
-            time.sleep(2)
-        except Exception as e:
-            logger.error(f"Process updates error: {e}")
-            time.sleep(5)
+        USER_LANGUAGES[update.effective_user.id] = language
 
-# === FLASK ===
-app = Flask(__name__)
+        await update.effective_message.reply_text(
+            f"✅ Your language is now {language.title()}.\n\n"
+            "Send me a message and I'll translate it automatically."
+        )
 
-@app.route('/', methods=['GET'])
-def home():
-    users = storage.get_all_users()
-    return f"<h1>VIP Reload Bot</h1><p>Members: {len(users)}</p><p>Status: Active</p>"
+    except ValueError:
+        await update.effective_message.reply_text(
+            "❌ Language not recognized.\n"
+            "Try /languages to see available languages."
+        )
+    except Exception:
+        logger.exception("Could not set language")
+        await update.effective_message.reply_text(
+            "⚠️ The language service is temporarily unavailable. "
+            "Please try again."
+        )
 
-@app.route('/stats', methods=['GET'])
-def stats():
-    users = storage.get_all_users()
-    return jsonify({'members': len(users)})
 
-# === MAIN ===
+async def translate_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if len(context.args) < 2:
+        await update.effective_message.reply_text(
+            "Usage: /translate Spanish Hello, how are you?"
+        )
+        return
+
+    target = context.args[0]
+    text = " ".join(context.args[1:])
+
+    try:
+        translated = await translate_text(text, target)
+
+        if not translated:
+            raise ValueError("Empty translation")
+
+        await update.effective_message.reply_text(
+            f"🌍 Translation ({target.title()}):\n\n{translated}"
+        )
+
+    except ValueError:
+        await update.effective_message.reply_text(
+            "❌ Language not recognized. Use /languages to see options."
+        )
+    except Exception:
+        logger.exception("Translation command failed")
+        await update.effective_message.reply_text(
+            "⚠️ Translation failed. Please try again later."
+        )
+
+
+async def languages(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    try:
+        supported = GoogleTranslator().get_supported_languages()
+        names = ", ".join(name.title() for name in supported)
+
+        await update.effective_message.reply_text(
+            "🌍 Supported languages:\n\n" + names
+        )
+
+    except Exception:
+        logger.exception("Could not retrieve languages")
+        await update.effective_message.reply_text(
+            "⚠️ Could not load languages. Please try again later."
+        )
+
+
+async def my_language(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    language = USER_LANGUAGES.get(update.effective_user.id)
+
+    if language:
+        await update.effective_message.reply_text(
+            f"🌍 Your selected language is {language.title()}."
+        )
+    else:
+        await update.effective_message.reply_text(
+            "You haven't selected a language.\n"
+            "Use /setlang Spanish, for example."
+        )
+
+
+async def stop_translation(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    USER_LANGUAGES.pop(update.effective_user.id, None)
+
+    await update.effective_message.reply_text(
+        "✅ Automatic translation is disabled.\n"
+        "Use /setlang followed by a language to enable it again."
+    )
+
+
+async def translate_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    user = update.effective_user
+    message = update.effective_message
+
+    if not user or not message or not message.text:
+        return
+
+    target = USER_LANGUAGES.get(user.id)
+
+    if not target:
+        await message.reply_text(
+            "🌍 Choose your language first:\n"
+            "/setlang Spanish\n\n"
+            "Or translate one message directly:\n"
+            "/translate French Hello there"
+        )
+        return
+
+    try:
+        translated = await translate_text(message.text, target)
+
+        if not translated:
+            raise ValueError("Empty translation")
+
+        await message.reply_text(translated)
+
+    except Exception:
+        logger.exception("Automatic translation failed")
+        await message.reply_text(
+            "⚠️ Translation failed. Please try again later."
+        )
+
+
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    logger.error(
+        "Unhandled Telegram error",
+        exc_info=context.error,
+    )
+
+
 def main():
-    logger.info("Starting VIP Reload Bot...")
-    threading.Thread(target=process_updates, daemon=True).start()
-    app.run(host='0.0.0.0', port=PORT)
+    if not TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN is missing. Add your token in Railway Variables."
+        )
 
-if __name__ == '__main__':
+    app = Application.builder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("setlang", set_language))
+    app.add_handler(CommandHandler("translate", translate_command))
+    app.add_handler(CommandHandler("languages", languages))
+    app.add_handler(CommandHandler("mylang", my_language))
+    app.add_handler(CommandHandler("stop", stop_translation))
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            translate_message,
+        )
+    )
+
+    app.add_error_handler(error_handler)
+
+    logger.info("Translation bot starting...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
     main()
